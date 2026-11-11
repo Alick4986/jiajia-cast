@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Modified for JiaJia Cast. -->
+<resources>
+    <style name="Theme.MirrorCast" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101C29</item>
+        <item name="android:statusBarColor">#101C29</item>
+        <item name="android:navigationBarColor">#101C29</item>
+        <item name="android:colorAccent">#71D9BE</item>
+    </style>
+</resources>
