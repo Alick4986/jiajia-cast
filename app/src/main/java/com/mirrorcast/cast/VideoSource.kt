@@ -63,13 +63,6 @@ class VideoSource(
     private var bitrateWinFrames = 0
     private var bitrateWinStart = System.nanoTime()
 
-    // ---- 静止画面自适应降帧（仅在编码线程访问） ----
-    // 帧很小=P帧内容变化少≈静止。连续多帧很小则下调目标帧率省资源；画面动起来再升回。
-    private var staticCount = 0
-    private var currentAdaptiveFps = 0        // 0=未设置过
-    private val STATIC_TINY = 1800            // 单帧字节低于此视为"几乎静止"
-    private val STATIC_TRIGGER = 12           // 连续这么多帧静止则降帧
-
     private var lastErrLogMs = 0L
 
     fun start(): Boolean {
@@ -78,6 +71,9 @@ class VideoSource(
             fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             fmt.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            if (Build.VERSION.SDK_INT >= 29) {
+                fmt.setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, frameRate.toFloat())
+            }
             fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyIntervalSec.toInt().coerceAtLeast(1)) // 关键帧间隔(秒)
             // 强制 Profile/Level：让编码器在关键帧内携带 SPS/PPS（MediaTek 需显式指定才给参数）
             try { fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) } catch (_: Exception) {}
@@ -155,35 +151,6 @@ class VideoSource(
                                     bitrateWinBytes = 0; bitrateWinFrames = 0; bitrateWinStart = System.nanoTime()
                                 }
                                 val key = (encInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 || isKeyframe(bytes)
-                                // 静止/动态自适应降帧：小帧连续超过阈值则降帧，反之恢复
-                                if (key) {
-                                    staticCount = 0 // 关键帧算"变化"，重置静电计数
-                                } else {
-                                    if (bytes.size < STATIC_TINY) {
-                                        if (staticCount < STATIC_TRIGGER) staticCount++
-                                        // 持续静止：降到最低档（约原帧率的 1/3，至少 ≥5）
-                                        val target = (frameRate / 3).coerceAtLeast(5)
-                                        if (staticCount >= STATIC_TRIGGER && currentAdaptiveFps != target) {
-                                            currentAdaptiveFps = target
-                                            try {
-                                                val b = android.os.Bundle()
-                                                b.putInt(MediaFormat.KEY_FRAME_RATE, target)
-                                                encoder?.setParameters(b)
-                                            } catch (_: Exception) {}
-                                        }
-                                    } else {
-                                        // 画面在动：恢复原帧率
-                                        staticCount = 0
-                                        if (currentAdaptiveFps != 0 && currentAdaptiveFps != frameRate) {
-                                            currentAdaptiveFps = frameRate
-                                            try {
-                                                val b = android.os.Bundle()
-                                                b.putInt(MediaFormat.KEY_FRAME_RATE, frameRate)
-                                                encoder?.setParameters(b)
-                                            } catch (_: Exception) {}
-                                        }
-                                    }
-                                }
                                 // 修复：SPS/PPS 可能出现在任意 AU 开头（尤其 format-change 后首帧），对每帧都尝试提取
                                 if (csd0 == null || csd1 == null) {
                                     extractSpsPps(bytes)

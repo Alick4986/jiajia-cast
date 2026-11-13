@@ -10,8 +10,12 @@
 
 1. 手机和投影仪连接同一个家庭 Wi-Fi。
 2. 投影仪打开应用，点「接收投屏」。
-3. 手机点「发送投屏」，选择投影仪，再确认安卓的屏幕共享提示。
+3. 手机或平板点「发送投屏」，选择设备、扫描接收端二维码，或输入接收端显示的 IP，再确认安卓的屏幕共享提示。
 4. 结束时，点手机上的「结束投屏」，或按投影仪遥控器的返回键。
+
+## 发送端设置
+
+连接前可选择画质、帧率上限、音画缓冲和接收端显示方式。两端均使用 0.2.7 时，缓冲和显示设置会随连接发送。画面按原比例缩放，选择「铺满屏幕」时会居中裁切。调整后重新连接即可生效。
 
 ## 声音与兼容性
 
@@ -27,4 +31,4 @@
 
 ## 许可证与致谢
 
-H.264 编解码部分改自 [MirrorCast H264](https://github.com/jie-dle/mirrorcast-h264)，基于 [上游版本 d048b0b](https://github.com/jie-dle/mirrorcast-h264/commit/d048b0b713ca9af3e5b26289ac0cb63b12e3dbd7)。本项目调整了设备发现、连接方向、投屏流程和中文界面，并加入应用声音共享及新的启动图标。许可证见 [Apache-2.0](LICENSE)。
+H.264 编解码部分改自 [MirrorCast H264](https://github.com/jie-dle/mirrorcast-h264)，基于 [上游版本 d048b0b](https://github.com/jie-dle/mirrorcast-h264/commit/d048b0b713ca9af3e5b26289ac0cb63b12e3dbd7)。本项目调整了设备发现、连接方向、投屏流程和中文界面，并加入应用声音共享及新的启动图标。扫码使用 [ZXing Android Embedded](https://github.com/journeyapps/zxing-android-embedded)。许可证见 [Apache-2.0](LICENSE)。

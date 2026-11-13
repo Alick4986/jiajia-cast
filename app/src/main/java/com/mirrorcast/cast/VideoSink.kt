@@ -7,6 +7,7 @@ import android.util.Log
 import android.view.Surface
 import com.mirrorcast.util.DiagLog
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 
 /**
  * 视频接收渲染：Annex-B 帧 → MediaCodec 硬解 → Surface。
@@ -17,9 +18,8 @@ class VideoSink(private val width: Int, private val height: Int, private val pre
     private var decoder: MediaCodec? = null
     private val decInfo = MediaCodec.BufferInfo()
     private var decodeThread: Thread? = null
-    // 队列容量 8（V0.3.2 由 2 扩容）：吸收 Wi-Fi 延迟抖动造成的成批到达（3~5 帧批次），
-    // 稳态解码 30fps≈入队 30fps 队列近空、延迟 <100ms；配合 push 保关键帧策略。
     private val queue = ArrayBlockingQueue<Frame>(8)
+    private var needsKeyframe = true
 
     @Volatile var running = false
         private set
@@ -89,16 +89,9 @@ class VideoSink(private val width: Int, private val height: Int, private val pre
                         continue
                     }
                     val dec = decoder!!
-                    val f = queue.poll()
+                    while (running && drain(dec)) { /* Release all ready output buffers. */ }
+                    val f = queue.poll(4, TimeUnit.MILLISECONDS)
                     if (f != null) feed(f)
-                    drain(dec)
-                    // 节流：避免 dequeue/渲染循环忙转空耗 CPU；恢复到所需节奏
-                    if (f != null) {
-                        // 有帧被处理时也留出调度间隙，防止 50+fps 空转
-                        Thread.sleep(1)
-                    } else {
-                        Thread.sleep(3)
-                    }
                 } catch (e: InterruptedException) {
                     break
                 } catch (t: Throwable) {
@@ -114,41 +107,36 @@ class VideoSink(private val width: Int, private val height: Int, private val pre
     fun push(bytes: ByteArray, keyframe: Boolean, ptsUs: Long) {
         if (!running) return
         if (queue.remainingCapacity() == 0) {
-            if (keyframe) {
-                // 保关键帧策略①：新关键帧优先，丢最旧帧腾位（新关键帧自带完整参考链）
-                val dropped = queue.poll()
-                droppedFrames++
-                if (dropped != null && VideoSource.isKeyframe(dropped.bytes)) droppedKey++
-            } else {
-                // 保关键帧策略②：非关键帧优先丢队列中最早的非关键帧；队列只剩关键帧则丢新帧本身
-                val victim = queue.firstOrNull { !it.keyframe }
-                if (victim != null) {
-                    queue.remove(victim)
-                    droppedFrames++
-                } else {
-                    droppedFrames++
-                    return // 保留关键帧，丢弃新帧（不入队）
-                }
-            }
+            val skipped = ArrayList<Frame>()
+            queue.drainTo(skipped)
+            droppedFrames += skipped.size
+            droppedKey += skipped.count { it.keyframe }
+            needsKeyframe = true
+        }
+        if (needsKeyframe && !keyframe) {
+            droppedFrames++
+            return
         }
         queue.offer(Frame(bytes, ptsUs, keyframe))
+        needsKeyframe = false
     }
 
     private fun feed(f: Frame) {
         val dec = decoder ?: return
-        val inIdx = dec.dequeueInputBuffer(100_000)
-        if (inIdx >= 0) {
-            val ib = dec.getInputBuffer(inIdx)!!
-            ib.clear()
-            ib.put(f.bytes)
-            dec.queueInputBuffer(inIdx, 0, f.bytes.size, f.ptsUs, 0)
-        } else {
-            discardedFrames++ // 探针：解码器输入缓冲不可用弃帧
+        while (running) {
+            val inIdx = dec.dequeueInputBuffer(4_000)
+            if (inIdx >= 0) {
+                val input = dec.getInputBuffer(inIdx)!!
+                input.clear()
+                input.put(f.bytes)
+                dec.queueInputBuffer(inIdx, 0, f.bytes.size, f.ptsUs, 0)
+                return
+            }
+            drain(dec)
         }
-        // 输入缓冲不可用则丢弃该帧（保实时）
     }
 
-    private fun drain(dec: MediaCodec) {
+    private fun drain(dec: MediaCodec): Boolean {
         val outIdx = dec.dequeueOutputBuffer(decInfo, 0)
         if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
             // 解码器输出格式变化：上报真实宽高，供 UI 比例匹配（否则 videoRatio 用默认值会变形）
@@ -165,12 +153,16 @@ class VideoSink(private val width: Int, private val height: Int, private val pre
             } catch (_: Exception) {}
         } else if (outIdx >= 0) {
             val t0 = System.nanoTime()
-            dec.releaseOutputBuffer(outIdx, true)
-            renderedFrames++
+            val waitUs = decInfo.presentationTimeUs - t0 / 1_000
+            if (waitUs > 0) TimeUnit.MICROSECONDS.sleep(waitUs)
+            val render = running && waitUs >= -120_000
+            dec.releaseOutputBuffer(outIdx, render)
+            if (render) renderedFrames++ else discardedFrames++
             lastDecodeMs = (System.nanoTime() - t0) / 1_000_000.0
         } else {
-            Thread.sleep(2)
+            return false
         }
+        return true
     }
 
     /** 从关键帧里提取 SPS/PPS 构造解码器 MediaFormat；缺任一返回 null */

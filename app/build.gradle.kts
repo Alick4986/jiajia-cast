@@ -12,8 +12,12 @@ android {
         applicationId = "com.mirrorcast.lan"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.2.2"
+        versionCode = 9
+        versionName = "0.2.7"
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {
@@ -24,4 +28,8 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+dependencies {
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("androidx.core:core:1.12.0")
 }

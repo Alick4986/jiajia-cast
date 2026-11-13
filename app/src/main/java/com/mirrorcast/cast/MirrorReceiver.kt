@@ -12,14 +12,20 @@ import java.net.Socket
 internal const val VIDEO_PORT = 49743
 internal const val PROTOCOL = 0x4C4D5231 // LMR1: video only
 internal const val PROTOCOL_WITH_AUDIO = 0x4C4D5232 // LMR2: video and PCM audio
+internal const val PROTOCOL_WITH_OPTIONS = 0x4C4D5233 // LMR3: sender buffer and screen fit
+internal const val FLAG_AUDIO = 1
+internal const val FLAG_FILL = 2
 internal const val FRAME_AUDIO = 2
 internal const val MAX_FRAME = 2 * 1024 * 1024
+internal const val MAX_VIDEO_SIZE = 1920
 
 internal class MirrorReceiver(
     private val surface: Surface,
     private val onVideo: (Int, Int) -> Unit,
     private val onWaiting: () -> Unit,
-    private val onFailure: () -> Unit
+    private val onFailure: () -> Unit,
+    private val onReady: () -> Unit = {},
+    private val onConnected: (CastOptions) -> Unit = {}
 ) {
     private val server = ServerSocket()
     @Volatile private var client: Socket? = null
@@ -29,6 +35,7 @@ internal class MirrorReceiver(
             try {
                 server.reuseAddress = true
                 server.bind(InetSocketAddress(VIDEO_PORT))
+                onReady()
                 while (!server.isClosed) {
                     server.accept().use { connection ->
                         client = connection
@@ -56,15 +63,42 @@ internal class MirrorReceiver(
         connection.soTimeout = 8000
         val input = DataInputStream(BufferedInputStream(connection.getInputStream()))
         val protocol = input.readInt()
-        if (protocol != PROTOCOL && protocol != PROTOCOL_WITH_AUDIO) return
+        if (protocol != PROTOCOL && protocol != PROTOCOL_WITH_AUDIO && protocol != PROTOCOL_WITH_OPTIONS) return
         val width = input.readUnsignedShort()
         val height = input.readUnsignedShort()
-        if (width !in 16..1280 || height !in 16..1280 || width % 2 != 0 || height % 2 != 0) return
+        if (width !in 16..MAX_VIDEO_SIZE || height !in 16..MAX_VIDEO_SIZE || width % 2 != 0 || height % 2 != 0) return
+        val flags = if (protocol == PROTOCOL_WITH_OPTIONS) input.readUnsignedByte() else 0
+        val options = if (protocol == PROTOCOL_WITH_OPTIONS) {
+            val delayMs = input.readUnsignedShort()
+            if (delayMs !in BUFFER_OPTIONS || flags and (FLAG_AUDIO or FLAG_FILL).inv() != 0) return
+            CastOptions(delayMs, flags and FLAG_FILL != 0)
+        } else {
+            CastOptions()
+        }
+        val hasAudio = protocol == PROTOCOL_WITH_AUDIO || flags and FLAG_AUDIO != 0
         val sink = VideoSink(width, height, surface)
         sink.onFormatReady = onVideo
-        var audio: MirrorAudioPlayer? = null
+        val playback = PlaybackBuffer(options.bufferMs)
+        val worker = Thread({
+            var audio: MirrorAudioPlayer? = null
+            try {
+                while (true) {
+                    val packet = playback.take() ?: break
+                    if (packet.type == FRAME_AUDIO) {
+                        val player = audio ?: MirrorAudioPlayer().also { audio = it }
+                        player.push(packet.data)
+                    } else {
+                        sink.push(packet.data, packet.type == 1, packet.playAtUs)
+                    }
+                }
+            } finally {
+                audio?.close()
+            }
+        }, "mirror-playout")
         try {
             if (!sink.start()) return
+            worker.start()
+            onConnected(options)
             DataOutputStream(connection.getOutputStream()).writeInt(protocol)
             // A static screen may produce no new frames. Closing the socket interrupts readFully().
             connection.soTimeout = 0
@@ -73,7 +107,7 @@ internal class MirrorReceiver(
                 require(length in 1..MAX_FRAME) { "Invalid frame length" }
                 val type = input.readUnsignedByte()
                 if (type == FRAME_AUDIO) {
-                    require(protocol == PROTOCOL_WITH_AUDIO &&
+                    require(hasAudio &&
                         length <= AUDIO_FRAME_BYTES && length % 4 == 0) { "Invalid audio frame" }
                 } else {
                     require(type == 0 || type == 1) { "Invalid video frame type" }
@@ -81,16 +115,15 @@ internal class MirrorReceiver(
                 val time = input.readLong()
                 val data = ByteArray(length)
                 input.readFully(data)
-                if (type == FRAME_AUDIO) {
-                    val player = audio ?: MirrorAudioPlayer().also { audio = it }
-                    player.push(data)
-                } else {
-                    sink.push(data, type == 1, time)
-                }
+                playback.offer(data, type, time)
             }
         } finally {
-            audio?.close()
-            sink.stop()
+            playback.close()
+            try {
+                worker.join()
+            } finally {
+                sink.stop()
+            }
         }
     }
 

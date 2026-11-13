@@ -11,6 +11,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.AudioManager
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -23,6 +24,8 @@ import com.mirrorcast.util.DiagLog
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
+import java.net.SocketException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ArrayBlockingQueue
@@ -33,10 +36,12 @@ class Phase0Service : Service() {
     private val frames = ArrayBlockingQueue<Frame>(8)
     private val audioFrames = ArrayBlockingQueue<Frame>(6)
     private val main = Handler(Looper.getMainLooper())
-    private val connection = Socket()
+    @Volatile private var connection = Socket()
+    private data class Channel(val input: DataInputStream, val output: DataOutputStream)
     private var projection: MediaProjection? = null
     private var source: VideoSource? = null
     private var worker: Thread? = null
+    private var savedMediaVolume: Int? = null
     @Volatile private var stopping = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -52,7 +57,13 @@ class Phase0Service : Service() {
             val address = intent?.getStringExtra(ADDRESS)
             val width = intent?.getIntExtra(WIDTH, 0) ?: 0
             val height = intent?.getIntExtra(HEIGHT, 0) ?: 0
-            require(permission != null && !address.isNullOrBlank() && width in 16..1280 && height in 16..1280)
+            val mutePhone = intent?.getBooleanExtra(MUTE_PHONE, false) == true
+            val bitrate = intent?.getIntExtra(BITRATE, 3_200_000) ?: 3_200_000
+            val frameRate = intent?.getIntExtra(FRAME_RATE, 30)?.takeIf { it in FPS_OPTIONS } ?: 30
+            val bufferMs = intent?.getIntExtra(BUFFER_MS, 1000)?.takeIf { it in BUFFER_OPTIONS } ?: 1000
+            val options = CastOptions(bufferMs, intent?.getBooleanExtra(FILL_SCREEN, false) == true)
+            require(permission != null && !address.isNullOrBlank() &&
+                width in 16..MAX_VIDEO_SIZE && height in 16..MAX_VIDEO_SIZE)
             val notification = notification()
             if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -66,7 +77,9 @@ class Phase0Service : Service() {
                 override fun onStop() { if (!stopping) stopSelf() }
             }, main)
             state = "正在连接投影仪…"
-            worker = Thread({ send(media, address, width, height) }, "mirror-sender").also { it.start() }
+            worker = Thread({
+                send(media, address, width, height, bitrate, frameRate, options, mutePhone)
+            }, "mirror-sender").also { it.start() }
         } catch (error: Exception) {
             DiagLog.log("无法启动投屏：${error.message}")
             state = "无法启动投屏，请重试"
@@ -75,23 +88,19 @@ class Phase0Service : Service() {
         return START_NOT_STICKY
     }
 
-    private fun send(media: MediaProjection, address: String, width: Int, height: Int) {
+    private fun send(
+        media: MediaProjection, address: String, width: Int, height: Int, bitrate: Int,
+        frameRate: Int, options: CastOptions, mutePhone: Boolean
+    ) {
         var audio: PlaybackAudioCapture? = null
         try {
             val canCaptureAudio = Build.VERSION.SDK_INT >= 29 &&
                 checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            val protocol = if (canCaptureAudio) PROTOCOL_WITH_AUDIO else PROTOCOL
-            connection.tcpNoDelay = true
-            connection.connect(InetSocketAddress(address, VIDEO_PORT), 4500)
-            connection.soTimeout = 5000
-            val output = DataOutputStream(BufferedOutputStream(connection.getOutputStream()))
-            output.writeInt(protocol)
-            output.writeShort(width)
-            output.writeShort(height)
-            output.flush()
-            val input = DataInputStream(connection.getInputStream())
-            check(input.readInt() == protocol)
-            connection.soTimeout = 0
+            val modern = openChannel(address, width, height, canCaptureAudio, options)
+            val (input, output) = modern ?: run {
+                check(!stopping)
+                requireNotNull(openChannel(address, width, height, canCaptureAudio, null))
+            }
             // The receiver has no other messages. EOF lets us stop even on a static screen.
             Thread({
                 try { input.read() } catch (_: java.io.IOException) {}
@@ -100,15 +109,23 @@ class Phase0Service : Service() {
                     stopSelf()
                 }
             }, "mirror-disconnect").start()
-            val video = VideoSource(media, width, height, 25, 4_000_000, keyIntervalSec = 1f)
+            val video = VideoSource(media, width, height, frameRate, bitrate, keyIntervalSec = 1f)
             var needsKeyFrame = true
+            var videoClockOffset: Long? = null
             video.frameListener = FrameListener { data, key, time ->
+                val nowUs = System.nanoTime() / 1_000L
+                val offset = videoClockOffset ?: (if (kotlin.math.abs(nowUs - time) > 2_000_000L) {
+                    nowUs - time
+                } else {
+                    0L
+                }).also { videoClockOffset = it }
+                val timestamp = time + offset
                 if (data.size <= MAX_FRAME && (!needsKeyFrame || key)) {
-                    if (!frames.offer(Frame(data, if (key) 1 else 0, time))) {
+                    if (!frames.offer(Frame(data, if (key) 1 else 0, timestamp))) {
                         frames.clear()
                         needsKeyFrame = true
                         if (key) {
-                            frames.offer(Frame(data, 1, time))
+                            frames.offer(Frame(data, 1, timestamp))
                             needsKeyFrame = false
                         } else {
                             video.requestSyncFrame()
@@ -121,12 +138,13 @@ class Phase0Service : Service() {
             source = video
             if (stopping) return
             if (!video.start()) {
-                state = "手机无法启动屏幕编码"
+                state = "无法启动屏幕编码，请试较低画质或帧率"
                 return
             }
             if (canCaptureAudio && Build.VERSION.SDK_INT >= 29) {
                 val capture = PlaybackAudioCapture(media) { data ->
-                    val frame = Frame(data, FRAME_AUDIO, System.nanoTime() / 1000L)
+                    val durationUs = data.size * 20_000L / AUDIO_FRAME_BYTES
+                    val frame = Frame(data, FRAME_AUDIO, System.nanoTime() / 1_000L - durationUs)
                     if (!audioFrames.offer(frame)) {
                         audioFrames.poll()
                         audioFrames.offer(frame)
@@ -134,7 +152,13 @@ class Phase0Service : Service() {
                 }
                 if (capture.start()) audio = capture
             }
-            state = if (audio != null) "正在投屏" else "正在投屏（仅画面）"
+            state = when {
+                audio == null -> "正在投屏（仅画面）"
+                !mutePhone -> "正在投屏"
+                mutePhoneMedia() -> "正在投屏（仅接收端出声）"
+                else -> "正在投屏（请手动调低手机媒体音量）"
+            }
+            if (modern == null) state += " · 旧版接收端，请升级以应用缓冲和显示设置"
             while (!stopping && video.running) {
                 val sound = audioFrames.poll()
                 if (sound != null) writeFrame(output, sound)
@@ -149,11 +173,48 @@ class Phase0Service : Service() {
             }
         } finally {
             stopping = true
+            restorePhoneMedia()
             audio?.close()
             source?.stop()
             try { connection.close() } catch (_: java.io.IOException) {}
             stopSelf()
         }
+    }
+
+    private fun openChannel(
+        address: String, width: Int, height: Int, audio: Boolean, options: CastOptions?
+    ): Channel? {
+        connection.close()
+        val socket = Socket()
+        connection = socket
+        check(!stopping)
+        socket.tcpNoDelay = true
+        socket.connect(InetSocketAddress(address, VIDEO_PORT), 4500)
+        socket.soTimeout = 5000
+        val protocol = when {
+            options != null -> PROTOCOL_WITH_OPTIONS
+            audio -> PROTOCOL_WITH_AUDIO
+            else -> PROTOCOL
+        }
+        val input = DataInputStream(socket.getInputStream())
+        val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+        try {
+            output.writeInt(protocol)
+            output.writeShort(width)
+            output.writeShort(height)
+            if (options != null) {
+                val flags = (if (audio) FLAG_AUDIO else 0) or (if (options.fillScreen) FLAG_FILL else 0)
+                output.writeByte(flags)
+                output.writeShort(options.bufferMs)
+            }
+            output.flush()
+            check(input.readInt() == protocol)
+        } catch (error: java.io.IOException) {
+            if (options != null && (error is EOFException || error is SocketException)) return null
+            throw error
+        }
+        socket.soTimeout = 0
+        return Channel(input, output)
     }
 
     private fun writeFrame(output: DataOutputStream, frame: Frame) {
@@ -164,8 +225,41 @@ class Phase0Service : Service() {
         output.flush()
     }
 
+    @Synchronized
+    private fun mutePhoneMedia(): Boolean {
+        if (stopping) return false
+        val manager = getSystemService(AudioManager::class.java)
+        return try {
+            if (manager.isVolumeFixed) return false
+            val original = manager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (original == 0) return true
+            manager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            savedMediaVolume = original
+            manager.getStreamVolume(AudioManager.STREAM_MUSIC) == 0
+        } catch (error: RuntimeException) {
+            DiagLog.log("无法静音手机媒体：${error.message}")
+            false
+        }
+    }
+
+    @Synchronized
+    private fun restorePhoneMedia() {
+        val original = savedMediaVolume ?: return
+        savedMediaVolume = null
+        val manager = getSystemService(AudioManager::class.java)
+        try {
+            // If the user raised the volume during the session, keep their choice.
+            if (manager.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                manager.setStreamVolume(AudioManager.STREAM_MUSIC, original, 0)
+            }
+        } catch (error: RuntimeException) {
+            DiagLog.log("无法恢复手机媒体音量：${error.message}")
+        }
+    }
+
     override fun onDestroy() {
         stopping = true
+        restorePhoneMedia()
         try { connection.close() } catch (_: java.io.IOException) {}
         worker?.interrupt()
         try { projection?.stop() } catch (_: Exception) {}
@@ -197,6 +291,11 @@ class Phase0Service : Service() {
         const val ADDRESS = "address"
         const val WIDTH = "width"
         const val HEIGHT = "height"
+        const val BITRATE = "bitrate"
+        const val FRAME_RATE = "frame_rate"
+        const val BUFFER_MS = "buffer_ms"
+        const val FILL_SCREEN = "fill_screen"
+        const val MUTE_PHONE = "mute_phone_media"
         @Volatile var active = false
         @Volatile var state = ""
     }
