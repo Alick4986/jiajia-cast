@@ -5,6 +5,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
@@ -23,15 +24,20 @@ fun interface FrameListener {
  */
 class VideoSource(
     private val projection: MediaProjection,
-    private val width: Int,
-    private val height: Int,
+    private val requestedWidth: Int,
+    private val requestedHeight: Int,
     private val frameRate: Int = 30,
     private val bitrate: Int = 10_000_000,
-    private val useVbr: Boolean = true,
     private val keyIntervalSec: Float = 0.5f
 ) {
 
     var frameListener: FrameListener? = null
+    var width = requestedWidth
+        private set
+    var height = requestedHeight
+        private set
+    var startupError: String? = null
+        private set
 
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
@@ -65,8 +71,58 @@ class VideoSource(
 
     private var lastErrLogMs = 0L
 
-    fun start(): Boolean {
+    @Synchronized
+    fun prepare(): Boolean {
+        val failures = mutableListOf<String>()
+        val tried = mutableSetOf<String>()
+        if (tryEncoder(null, tried, failures)) return true
+        val alternatives = try {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { info ->
+                info.isEncoder && info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) } &&
+                    (Build.VERSION.SDK_INT < 29 || !info.isAlias)
+            }
+        } catch (error: Exception) {
+            failures += "读取备用编码器失败（${error.javaClass.simpleName}）"
+            emptyList()
+        }
+        for (info in alternatives) {
+            if (Thread.currentThread().isInterrupted) break
+            if (info.name !in tried && tryEncoder(info.name, tried, failures)) return true
+        }
+        startupError = failures.joinToString("\n", prefix = "H.264 编码器启动准备失败\n")
+        return false
+    }
+
+    private fun tryEncoder(name: String?, tried: MutableSet<String>, failures: MutableList<String>): Boolean {
+        var codecName = name ?: "系统默认"
+        var sizeLabel = "${requestedWidth}×$requestedHeight"
+        var stage = "无法创建 H.264 编码器"
         return try {
+            val mime = MediaFormat.MIMETYPE_VIDEO_AVC
+            val enc = if (name == null) MediaCodec.createEncoderByType(mime) else MediaCodec.createByCodecName(name)
+            encoder = enc
+            codecName = enc.name
+            tried += codecName
+            val info = enc.codecInfo
+            tried += info.name
+            if (Build.VERSION.SDK_INT >= 29) tried += info.canonicalName
+            stage = "读取 H.264 编码能力失败"
+            val capabilities = info.getCapabilitiesForType(mime)
+            stage = "H.264 编码器不支持屏幕输入"
+            require(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface in capabilities.colorFormats)
+            val videoCaps = requireNotNull(capabilities.videoCapabilities)
+            val size = findEncoderSize(requestedWidth, requestedHeight, videoCaps.widthAlignment, videoCaps.heightAlignment) { w, h ->
+                videoCaps.areSizeAndRateSupported(w, h, frameRate.toDouble())
+            }
+            if (size == null) {
+                stage = "H.264 编码器不支持此尺寸和帧率"
+                throw IllegalArgumentException()
+            }
+            width = size.first
+            height = size.second
+            sizeLabel = "${width}×$height"
+            stage = "H.264 编码器配置失败"
+            DiagLog.log("编码器：${enc.name}，请求 ${requestedWidth}×$requestedHeight，实际 ${width}×$height @ ${frameRate} 帧")
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -75,42 +131,50 @@ class VideoSource(
                 fmt.setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, frameRate.toFloat())
             }
             fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyIntervalSec.toInt().coerceAtLeast(1)) // 关键帧间隔(秒)
-            // 强制 Profile/Level：让编码器在关键帧内携带 SPS/PPS（MediaTek 需显式指定才给参数）
-            try { fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) } catch (_: Exception) {}
-            // VBR（可变码率）：相机/动态画面细节多时质量更稳，缓解马赛克；静态画面自动降低码率
-            try {
-                fmt.setInteger(
-                    MediaFormat.KEY_BITRATE_MODE,
-                    if (useVbr) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
-                    else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-                )
-            } catch (_: Exception) {}
-            if (Build.VERSION.SDK_INT >= 30) {
-                try { fmt.setInteger(MediaFormat.KEY_LATENCY, 1) } catch (_: Exception) {}
-            }
-            val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            encoder = enc
-            // 记录编码器硬件名（证明硬编生效，因 Android 无 GPU 占用 API）
-            try { DiagLog.log("编码器名: " + enc.name) } catch (_: Throwable) {}
             enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            stage = "H.264 编码器输入画面创建失败"
             encSurface = enc.createInputSurface()
+            stage = "H.264 编码器启动失败"
             enc.start()
-            // 请求首关键帧立即输出（配置帧随 IDR 出）
-            try { val b = android.os.Bundle(); b.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(b) } catch (_: Exception) {}
-            virtualDisplay = projection.createVirtualDisplay(
-                "V3Source", width, height, 240,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                encSurface!!, null, null
-            )
-            running = true
-            DiagLog.log("视频源启动：${width}x${height} @${frameRate}fps ${bitrate / 1000}kbps ${if (useVbr) "VBR" else "CBR"} 关键帧${keyIntervalSec}s")
-            startEncodeThread()
             true
-        } catch (t: Throwable) {
-            logErr(t)
+        } catch (error: Exception) {
+            val message = "$codecName · $sizeLabel @ ${frameRate} 帧 · $stage（${describe(error)}）"
+            failures += message
+            DiagLog.log(message)
+            logErr(error)
             stop()
             false
         }
+    }
+
+    @Synchronized
+    fun start(): Boolean {
+        return try {
+            val enc = checkNotNull(encoder)
+            // 请求首关键帧立即输出（配置帧随 IDR 出）
+            try { val b = android.os.Bundle(); b.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0); enc.setParameters(b) } catch (_: Exception) {}
+            virtualDisplay = checkNotNull(projection.createVirtualDisplay(
+                "V3Source", width, height, 240,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                checkNotNull(encSurface), null, null
+            )) { "系统未能创建虚拟屏幕" }
+            running = true
+            DiagLog.log("视频源启动：${width}x${height} @${frameRate}fps ${bitrate / 1000}kbps 关键帧${keyIntervalSec}s")
+            startEncodeThread()
+            true
+        } catch (error: Exception) {
+            startupError = "安卓屏幕捕获启动失败（${describe(error)}）"
+            DiagLog.log(startupError.orEmpty())
+            logErr(error)
+            stop()
+            false
+        }
+    }
+
+    private fun describe(error: Exception): String {
+        val detail = (error as? MediaCodec.CodecException)?.diagnosticInfo
+            ?: error.message?.lineSequence()?.firstOrNull()?.take(110)
+        return error.javaClass.simpleName + (detail?.let { " · $it" }.orEmpty())
     }
 
     private fun startEncodeThread() {
@@ -287,7 +351,7 @@ class VideoSource(
         try { encoder?.stop() } catch (_: Exception) {}
         try { encoder?.release() } catch (_: Exception) {}
         encoder = null
-        encSurface?.release()
+        try { encSurface?.release() } catch (_: Exception) {}
         encSurface = null
         DiagLog.log("视频源已停止")
     }

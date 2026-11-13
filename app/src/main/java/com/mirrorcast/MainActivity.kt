@@ -6,10 +6,14 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.ConnectivityManager
@@ -20,6 +24,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.text.TextUtils
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.Surface
@@ -27,12 +32,12 @@ import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
@@ -59,6 +64,9 @@ class MainActivity : Activity() {
     private var receiver: MirrorReceiver? = null
     private var receiverSurface: Surface? = null
     private var selectedAddress: String? = null
+    private var selectedDevice: String? = null
+    private var manualConnection = false
+    private var streamInfoView: TextView? = null
     private var mutePhone = false
     private val settings by lazy { getSharedPreferences("cast_settings", MODE_PRIVATE) }
     private var quality = VideoQuality.CLEAR
@@ -68,6 +76,11 @@ class MainActivity : Activity() {
     private var devices = emptyList<Discovery.Device>()
     private var senderStatus: TextView? = null
     private var deviceList: LinearLayout? = null
+    private var senderColumns: LinearLayout? = null
+    private var homeActions: LinearLayout? = null
+    private var senderActions: LinearLayout? = null
+    private var senderSettings: LinearLayout? = null
+    private var senderDeviceHeading: TextView? = null
     private var shownState = ""
     private var shownActive = false
     private var generation = 0
@@ -82,6 +95,7 @@ class MainActivity : Activity() {
                 shownState = state
                 showDevices()
             }
+            streamInfoView?.text = Phase0Service.streamInfo
             handler.postDelayed(this, 350)
         }
     }
@@ -99,34 +113,80 @@ class MainActivity : Activity() {
     private fun showHome() {
         leaveScreen()
         screen = Screen.HOME
+        if (!BuildConfig.RECEIVER_ONLY) {
+            val page = senderColumn().apply { setPadding(dp(20), dp(40), dp(20), dp(24)) }
+            val scroll = ScrollView(this).apply {
+                setBackgroundColor(BACKGROUND)
+                addView(page)
+            }
+            setContentView(scroll)
+            page.addView(ImageView(this).apply { setImageResource(R.mipmap.ic_launcher) },
+                LinearLayout.LayoutParams(dp(64), dp(64)))
+            page.addView(senderText(getString(R.string.app_name), 32, Color.WHITE, true),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+            page.addView(senderText("两台设备连接同一个 Wi-Fi", 16, SECONDARY),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8); bottomMargin = dp(28) })
+            val actions = senderColumn().also(page::addView)
+            actions.addView(senderRow("发送投屏", "分享屏幕", connect = true) { showSender() })
+            actions.addView(senderRow("接收投屏", "观看投屏", connect = true) { showReceiver() })
+            homeActions = actions
+            layoutHomeActions()
+            page.addView(senderText("版本 ${BuildConfig.VERSION_NAME}", 14, SECONDARY),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24) })
+            return
+        }
         val panel = panel()
         panel.addView(label(getString(R.string.app_name), 32, true))
         panel.addView(label("手机和投影仪连接同一个 Wi-Fi。", 17))
         val receive = action("接收投屏") { showReceiver() }
-        val send = action("发送投屏") { showSender() }
-        panel.addView(send)
+        val send = if (BuildConfig.RECEIVER_ONLY) null else action("发送投屏") { showSender() }
+        send?.let(panel::addView)
         panel.addView(receive)
-        panel.addView(label("版本 ${BuildConfig.VERSION_NAME}", 14))
-        if (packageManager.hasSystemFeature("android.software.leanback")) receive.requestFocus()
+        val edition = if (BuildConfig.RECEIVER_ONLY) " · Android 6 接收版" else ""
+        panel.addView(label("版本 ${BuildConfig.VERSION_NAME}$edition", 14))
+        if (send == null || packageManager.hasSystemFeature("android.software.leanback")) receive.requestFocus()
         else send.requestFocus()
     }
 
     private fun showSender() {
         leaveScreen()
         screen = Screen.SEND
-        val panel = panel()
-        panel.addView(label("发送投屏", 30, true))
-        senderStatus = label("", 17).also(panel::addView)
-        if (Build.VERSION.SDK_INT >= 29) {
-            panel.addView(label("允许「麦克风」权限后，可同时共享应用声音。", 14))
-            panel.addView(CheckBox(this).apply {
-                text = "仅接收端出声"
-                isChecked = mutePhone
-                setOnCheckedChangeListener { _, checked -> mutePhone = checked }
-            })
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(BACKGROUND)
+            isFillViewport = true
         }
-        deviceList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }.also(panel::addView)
-        panel.addView(action("返回") { showHome() })
+        val page = senderColumn().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
+        scroll.addView(page, FrameLayout.LayoutParams(-1, -2))
+        setContentView(scroll)
+        page.addView(senderButton("‹ 返回") { showHome() }, LinearLayout.LayoutParams(-2, dp(48)))
+        page.addView(senderText("发送投屏", 32, Color.WHITE, bold = true),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12); bottomMargin = dp(22) })
+
+        val columns = LinearLayout(this).also { senderColumns = it; page.addView(it) }
+        val connection = senderColumn().also(columns::addView)
+        senderDeviceHeading = senderHeading("可用设备").also(connection::addView)
+        senderStatus = senderText("", 14, SECONDARY).apply {
+            setPadding(0, 0, 0, dp(12))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }.also(connection::addView)
+        deviceList = senderColumn().also(connection::addView)
+        senderActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val params = { LinearLayout.LayoutParams(0, dp(48), 1f) }
+            if (packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
+                addView(senderButton("扫码连接") {
+                    if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        openScanner()
+                    } else {
+                        requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION)
+                    }
+                }, params().apply { marginEnd = dp(10) })
+            }
+            addView(senderButton("手动 IP") { showAddressInput() }, params())
+        }.also { connection.addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }) }
+        senderSettings = senderColumn().also(columns::addView)
+        layoutSenderColumns()
+        showSenderSettings()
         shownState = Phase0Service.state
         shownActive = Phase0Service.active
         showDevices()
@@ -149,27 +209,78 @@ class MainActivity : Activity() {
     private fun showDevices() {
         val list = deviceList ?: return
         list.removeAllViews()
-        if (Phase0Service.active) {
-            senderStatus?.text = Phase0Service.state.ifBlank { "正在准备投屏…" }
-            list.addView(action("结束投屏") {
+        streamInfoView = null
+        val active = Phase0Service.active
+        val visibility = if (active) View.GONE else View.VISIBLE
+        senderActions?.visibility = visibility
+        senderSettings?.visibility = visibility
+        senderDeviceHeading?.text = if (active) "投屏状态" else "可用设备"
+        if (active) {
+            senderStatus?.text = ""
+            val status = Phase0Service.state.ifBlank { "正在准备投屏…" }
+            val name = Phase0Service.receiverLabel
+            val card = senderColumn().apply {
+                background = senderShape(CARD)
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                addView(senderText(name.ifBlank { "接收设备" }, 20, Color.WHITE, bold = true))
+                addView(senderText(status, 15, ACCENT).apply { setPadding(0, dp(8), 0, 0) })
+                streamInfoView = senderText(Phase0Service.streamInfo, 14, SECONDARY).apply {
+                    setPadding(0, dp(6), 0, 0)
+                }.also(::addView)
+            }
+            list.addView(card, LinearLayout.LayoutParams(-1, -2))
+            list.addView(senderButton("结束投屏", prominent = true) {
                 stopService(Intent(this, Phase0Service::class.java))
-            })
+            }, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(12) })
             return
         }
-        senderStatus?.text = Phase0Service.state.ifBlank {
+        val error = Phase0Service.state
+        senderStatus?.text = when {
+            error.startsWith("连不上接收端") -> "$error\n核对接收页上的 IP 和两台设备的 Wi-Fi。"
+            error.startsWith("H.264") -> "$error\n可试用上次成功的画质和帧率。"
+            else -> error
+        }.ifBlank {
             if (devices.isEmpty()) "在另一台设备打开「接收投屏」。" else "选择要投屏的设备。"
         }
-        for (device in devices) {
-            list.addView(action(device.name) { requestCapture(device.address.hostAddress ?: return@action) })
+        val lastAddress = settings.getString("last_address", null)
+        val lastName = settings.getString("last_device", null)
+        val lastDevice = devices.firstOrNull { it.address.hostAddress == lastAddress && it.name == lastName }
+        if (lastAddress != null && lastDevice != null) {
+            list.addView(senderRow("上次连接 · ${lastDevice.name}", "重连", connect = true) {
+                if (selectedAddress != null || Phase0Service.active) return@senderRow
+                quality = VideoQuality.entries.getOrNull(settings.getInt("last_quality", VideoQuality.CLEAR.ordinal))
+                    ?: VideoQuality.CLEAR
+                frameRate = settings.getInt("last_fps", 30)
+                bufferMs = settings.getInt("last_buffer", 1000)
+                fillScreen = settings.getBoolean("last_fill", false)
+                mutePhone = settings.getBoolean("last_mute", false)
+                showSenderSettings()
+                requestCapture(lastAddress, lastDevice.name)
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         }
-        list.addView(action("画质 · ${quality.label} · 长边 ${quality.longEdge}") { showQualityOptions() })
-        list.addView(action("帧率 · $frameRate 帧/秒") {
+        for (device in devices) {
+            list.addView(senderRow(device.name, "连接", connect = true) {
+                device.address.hostAddress?.let { requestCapture(it, device.name) }
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        }
+    }
+
+    private fun showSenderSettings() {
+        val panel = senderSettings ?: return
+        panel.removeAllViews()
+        panel.addView(senderHeading("投屏设置"))
+        val list = senderColumn().apply { background = senderShape(CARD) }
+        panel.addView(list, LinearLayout.LayoutParams(-1, -2))
+        list.addView(senderRow("画质", "${quality.label} ${quality.longEdge}") { showQualityOptions() })
+        addSenderDivider(list)
+        list.addView(senderRow("帧率", "$frameRate 帧/秒") {
             chooseOption("选择帧率上限", FPS_OPTIONS.map { "$it 帧/秒" }, FPS_OPTIONS.indexOf(frameRate)) {
                 frameRate = FPS_OPTIONS[it]
                 settings.edit().putInt("frame_rate", frameRate).apply()
             }
         })
-        list.addView(action("缓冲 · ${bufferLabel(bufferMs)}") {
+        addSenderDivider(list)
+        list.addView(senderRow("缓冲", bufferLabel(bufferMs)) {
             chooseOption("选择接收缓冲", BUFFER_OPTIONS.map(::bufferLabel), BUFFER_OPTIONS.indexOf(bufferMs)) {
                 bufferMs = BUFFER_OPTIONS[it]
                 settings.edit().putInt("buffer_ms", bufferMs).apply()
@@ -177,22 +288,130 @@ class MainActivity : Activity() {
         })
         val displayModes = listOf("显示完整画面", "铺满屏幕")
         val displayIndex = if (fillScreen) 1 else 0
-        list.addView(action("画面 · ${displayModes[displayIndex]}") {
+        addSenderDivider(list)
+        list.addView(senderRow("显示方式", displayModes[displayIndex]) {
             chooseOption("选择接收端显示方式", displayModes, displayIndex) {
                 fillScreen = it == 1
                 settings.edit().putBoolean("fill_screen", fillScreen).apply()
             }
         })
-        if (packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) {
-            list.addView(action("扫码连接") {
-                if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                    openScanner()
-                } else {
-                    requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION)
-                }
+        if (Build.VERSION.SDK_INT >= 29) {
+            addSenderDivider(list)
+            list.addView(Switch(this).apply {
+                text = "仅接收端出声"
+                textSize = 16f
+                setTextColor(Color.WHITE)
+                minimumHeight = dp(56)
+                setPadding(dp(16), 0, dp(16), 0)
+                isChecked = mutePhone
+                setOnCheckedChangeListener { _, checked -> mutePhone = checked }
+            }, LinearLayout.LayoutParams(-1, -2))
+            panel.addView(senderText("共享应用声音时，需允许「麦克风」权限。", 13, SECONDARY).apply {
+                setPadding(dp(4), dp(10), dp(4), 0)
             })
         }
-        list.addView(action("输入接收端 IP") { showAddressInput() })
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        layoutSenderColumns()
+        layoutHomeActions()
+    }
+
+    private fun layoutHomeActions() {
+        val actions = homeActions ?: return
+        val wide = resources.configuration.screenWidthDp >= 720 &&
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        actions.orientation = if (wide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        for (index in 0 until actions.childCount) {
+            actions.getChildAt(index).layoutParams = if (wide) {
+                LinearLayout.LayoutParams(0, -2, 1f).apply { if (index == 0) marginEnd = dp(12) }
+            } else {
+                LinearLayout.LayoutParams(-1, -2).apply { if (index != 0) topMargin = dp(12) }
+            }
+        }
+    }
+
+    private fun layoutSenderColumns() {
+        val columns = senderColumns ?: return
+        val config = resources.configuration
+        val sideBySide = config.screenWidthDp >= 720 && config.orientation == Configuration.ORIENTATION_LANDSCAPE
+        columns.orientation = if (sideBySide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        columns.getChildAt(0).layoutParams = if (sideBySide) {
+            LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(20) }
+        } else {
+            LinearLayout.LayoutParams(-1, -2)
+        }
+        columns.getChildAt(1).layoutParams = if (sideBySide) {
+            LinearLayout.LayoutParams(0, -2, 1f)
+        } else {
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(26) }
+        }
+    }
+
+    private fun senderColumn() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+    private fun senderText(value: String, size: Int, color: Int, bold: Boolean = false) =
+        TextView(this).apply {
+            text = value
+            textSize = size.toFloat()
+            setTextColor(color)
+            if (bold) typeface = Typeface.DEFAULT_BOLD
+        }
+
+    private fun senderHeading(value: String) = senderText(value, 19, Color.WHITE, bold = true).apply {
+        setPadding(0, 0, 0, dp(10))
+        if (Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
+    }
+
+    private fun senderShape(color: Int) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(14).toFloat()
+    }
+
+    private fun senderRipple(color: Int) = RippleDrawable(
+        ColorStateList.valueOf(0x2883E8CA),
+        senderShape(color),
+        null
+    )
+
+    private fun senderButton(value: String, prominent: Boolean = false, click: () -> Unit) =
+        Button(this).apply {
+            text = value
+            textSize = 15f
+            isAllCaps = false
+            setTextColor(if (prominent) BACKGROUND else ACCENT)
+            background = senderRipple(if (prominent) ACCENT else CARD)
+            setPadding(dp(14), 0, dp(14), 0)
+            setOnClickListener { click() }
+        }
+
+    private fun senderRow(title: String, value: String, connect: Boolean = false, trailing: Boolean = true, click: () -> Unit) =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(if (connect) 64 else 54)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = senderRipple(if (connect) DEVICE_CARD else CARD)
+            isFocusable = true
+            contentDescription = "$title，$value"
+            setOnClickListener { click() }
+            addView(senderText(title, 16, Color.WHITE, bold = connect).apply {
+                if (connect) {
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                }
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(senderText(if (trailing) "$value  ›" else value, 14, ACCENT).apply {
+                gravity = Gravity.END
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8) })
+        }
+
+    private fun addSenderDivider(list: LinearLayout) {
+        list.addView(View(this).apply { setBackgroundColor(DIVIDER) },
+            LinearLayout.LayoutParams(-1, dp(1)).apply { marginStart = dp(16); marginEnd = dp(16) })
     }
 
     private fun showQualityOptions() {
@@ -210,17 +429,42 @@ class MainActivity : Activity() {
         else -> "$ms 毫秒"
     }
 
+    private fun dialogPanel(title: String) = senderColumn().apply {
+        setPadding(dp(18), dp(18), dp(18), dp(16))
+        background = senderShape(CARD)
+        addView(senderHeading(title))
+    }
+
+    private fun senderDialog(content: LinearLayout): AlertDialog {
+        val scroll = ScrollView(this).apply { addView(content) }
+        return AlertDialog.Builder(this).setView(scroll).create().also { dialog ->
+            dialog.setOnShowListener {
+                dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+                val width = (resources.displayMetrics.widthPixels - dp(40)).coerceIn(dp(220), dp(480))
+                dialog.window?.setLayout(width, -2)
+            }
+        }
+    }
+
     private fun chooseOption(title: String, options: List<String>, selected: Int, apply: (Int) -> Unit) {
-        AlertDialog.Builder(this)
-            .setTitle(title)
-            .setSingleChoiceItems(options.toTypedArray(), selected) { dialog, index ->
+        val content = dialogPanel(title)
+        val dialog = senderDialog(content)
+        options.forEachIndexed { index, option ->
+            val checked = index == selected
+            content.addView(senderRow(option, if (checked) "✓" else "", connect = checked, trailing = false) {
                 apply(index)
                 dialog.dismiss()
-                showDevices()
-            }
-            .setNegativeButton("取消", null)
-            .show()
+                showSenderSettings()
+            }.apply {
+                isSelected = checked
+                contentDescription = if (checked) "$option，已选中" else option
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
+        }
+        content.addView(senderButton("取消") { dialog.dismiss() },
+            LinearLayout.LayoutParams(-2, dp(48)).apply { gravity = Gravity.END; topMargin = dp(8) })
+        dialog.show()
     }
+
 
     @Suppress("DEPRECATION")
     private fun openScanner() {
@@ -232,6 +476,8 @@ class MainActivity : Activity() {
                 .setOrientationLocked(false)
             if (resources.configuration.smallestScreenWidthDp < 600) {
                 options.setCaptureActivity(PortraitScannerActivity::class.java)
+            } else {
+                options.setCaptureActivity(ZoomScannerActivity::class.java)
             }
             startActivityForResult(options.createScanIntent(this), SCAN)
         } catch (error: RuntimeException) {
@@ -241,31 +487,53 @@ class MainActivity : Activity() {
     }
 
     private fun showAddressInput() {
+        val content = dialogPanel("手动连接")
+        val dialog = senderDialog(content)
+        content.addView(senderText("输入接收页上显示的 IP 地址", 14, SECONDARY))
         val addressField = EditText(this).apply {
             isSingleLine = true
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            hint = "接收端显示的 IPv4 地址"
+            hint = "例如 192.168.1.25"
+            setTextColor(Color.WHITE)
+            setHintTextColor(SECONDARY)
+            background = senderShape(BACKGROUND)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { error = null }
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            })
         }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("手动连接")
-            .setMessage("在平板或投影仪的「接收投屏」页面查看 IP。")
-            .setView(addressField)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("连接", null)
-            .create()
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val address = normalizeIpv4(addressField.text.toString())
-                if (address == null) {
-                    addressField.error = "请输入有效的 IPv4 地址，例如 192.168.1.25"
-                    return@setOnClickListener
-                }
-                dialog.dismiss()
-                requestCapture(address)
+        content.addView(addressField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        val recent = settings.getString("manual_history", "").orEmpty().split(',').mapNotNull(::normalizeIpv4)
+        if (recent.isNotEmpty()) {
+            content.addView(senderText("最近连接", 14, SECONDARY, true),
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+            for (address in recent) {
+                content.addView(senderRow(address, "填入", trailing = false) {
+                    addressField.setText(address)
+                    addressField.setSelection(address.length)
+                }, LinearLayout.LayoutParams(-1, -2))
             }
         }
+        val actions = LinearLayout(this).apply { gravity = Gravity.END }
+        actions.addView(senderButton("取消") { dialog.dismiss() }, LinearLayout.LayoutParams(-2, dp(48)))
+        actions.addView(senderButton("连接", prominent = true) {
+            val address = normalizeIpv4(addressField.text.toString())
+            if (address == null) {
+                addressField.error = "请输入有效的 IPv4 地址"
+                addressField.requestFocus()
+            } else {
+                dialog.dismiss()
+                requestCapture(address, manual = true)
+            }
+        }, LinearLayout.LayoutParams(-2, dp(48)).apply { marginStart = dp(10) })
+        content.addView(actions, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        content.isFocusableInTouchMode = true
+        content.requestFocus()
         dialog.show()
     }
+
 
     private fun normalizeIpv4(address: String): String? {
         val parts = address.trim().split('.')
@@ -305,9 +573,11 @@ class MainActivity : Activity() {
     }
 
     @Suppress("DEPRECATION")
-    private fun requestCapture(address: String) {
+    private fun requestCapture(address: String, deviceName: String? = null, manual: Boolean = false) {
         if (selectedAddress != null || Phase0Service.active) return
         selectedAddress = address
+        manualConnection = manual
+        selectedDevice = deviceName ?: devices.firstOrNull { it.address.hostAddress == address }?.name ?: address
         Phase0Service.state = ""
         if (Build.VERSION.SDK_INT >= 29 &&
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -358,7 +628,9 @@ class MainActivity : Activity() {
         }
         if (requestCode != CAPTURE) return
         val address = selectedAddress
+        val deviceName = selectedDevice
         selectedAddress = null
+        selectedDevice = null
         if (resultCode != RESULT_OK || data == null || address == null) {
             senderStatus?.text = "已取消屏幕共享"
             return
@@ -376,6 +648,9 @@ class MainActivity : Activity() {
             .putExtra(Phase0Service.BUFFER_MS, bufferMs)
             .putExtra(Phase0Service.FILL_SCREEN, fillScreen)
             .putExtra(Phase0Service.MUTE_PHONE, mutePhone)
+            .putExtra(Phase0Service.MANUAL, manualConnection)
+            .putExtra(Phase0Service.QUALITY, quality.ordinal)
+        Phase0Service.receiverLabel = deviceName ?: address
         Phase0Service.state = "正在准备投屏…"
         Phase0Service.active = true
         try {
@@ -413,6 +688,8 @@ class MainActivity : Activity() {
         waiting.addView(qr, LinearLayout.LayoutParams(qrSize, qrSize))
         val hint = label("正在启动接收…", 17)
         waiting.addView(hint)
+        val requestStatus = label("连接记录 · 尚未收到请求", 14)
+        waiting.addView(requestStatus)
         val exit = action("返回") { showHome() }
         waiting.addView(exit, LinearLayout.LayoutParams(dp(200), dp(56)))
         val waitingScreen = ScrollView(this).apply {
@@ -508,6 +785,10 @@ class MainActivity : Activity() {
                                 hint.text = "正在缓冲 · ${bufferLabel(options.bufferMs)}"
                             }
                         }
+                    }, onRequestStatus = { status ->
+                        runOnUiThread {
+                            if (generation == current && receiver != null) requestStatus.text = "连接记录 · $status"
+                        }
                     }).also { it.start() }
                 } catch (_: Exception) {
                     closeReceiver()
@@ -554,8 +835,15 @@ class MainActivity : Activity() {
         search = null
         devices = emptyList()
         selectedAddress = null
+        selectedDevice = null
         senderStatus = null
+        streamInfoView = null
         deviceList = null
+        senderColumns = null
+        homeActions = null
+        senderActions = null
+        senderSettings = null
+        senderDeviceHeading = null
         handler.removeCallbacks(updateSender)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.decorView.systemUiVisibility = 0
@@ -610,5 +898,10 @@ class MainActivity : Activity() {
         private const val CAMERA_PERMISSION = 203
         private const val SCAN = 204
         private val BACKGROUND = 0xFF101C29.toInt()
+        private val CARD = 0xFF1A2A3B.toInt()
+        private val SECONDARY = 0xFFB6C5D4.toInt()
+        private val ACCENT = 0xFF83E8CA.toInt()
+        private val DEVICE_CARD = 0xFF1A3741.toInt()
+        private val DIVIDER = 0xFF2D4052.toInt()
     }
 }

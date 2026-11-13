@@ -40,6 +40,11 @@
             android:screenOrientation="portrait"
             android:theme="@style/zxing_CaptureTheme"
             android:windowSoftInputMode="stateAlwaysHidden" />
+        <activity
+            android:name=".ZoomScannerActivity"
+            android:exported="false"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden" />
         <service
             android:name=".cast.Phase0Service"
             android:exported="false"

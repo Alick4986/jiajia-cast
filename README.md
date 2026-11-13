@@ -2,11 +2,16 @@
 
 ![佳佳简易投屏图标](docs/jiajia-cast-icon.png)
 
-把安卓手机的画面投到安卓投影仪或电视上。两台设备安装同一个 APK，连同一个 Wi-Fi 即可使用，无需登录或开会员。
+把安卓手机的画面投到安卓投影仪或电视上。两台设备安装适合各自系统的 APK，连同一个 Wi-Fi 即可使用，无需登录或开会员。
 
 ## 下载安装
 
-从 [Releases](https://github.com/Alick4986/jiajia-cast/releases) 下载 APK，在手机和投影仪上分别安装。两台设备都需要 Android 8.0 或以上，投影仪需要允许安装 APK。
+从 [Releases](https://github.com/Alick4986/jiajia-cast/releases) 下载适合设备的 APK。
+
+| 安装包 | 系统要求 | 用途 |
+| --- | --- | --- |
+| 标准版 0.2.12 | Android 8.0 或以上 | 手机、平板发送或接收 |
+| Android 6.0 接收版 0.2.8 | Android 6.0 或以上 | 旧投影仪、电视接收 |
 
 1. 手机和投影仪连接同一个家庭 Wi-Fi。
 2. 投影仪打开应用，点「接收投屏」。
@@ -15,7 +20,7 @@
 
 ## 发送端设置
 
-连接前可选择画质、帧率上限、音画缓冲和接收端显示方式。两端均使用 0.2.7 时，缓冲和显示设置会随连接发送。画面按原比例缩放，选择「铺满屏幕」时会居中裁切。调整后重新连接即可生效。
+连接前可选择画质、帧率上限、音画缓冲和接收端显示方式。标准版 0.2.12 与 Android 6.0 接收版 0.2.8 连接时，缓冲和显示设置会随连接发送。画面按原比例缩放，选择「铺满屏幕」时会居中裁切。调整后重新连接即可生效。
 
 ## 声音与兼容性
 
@@ -27,7 +32,7 @@
 
 ## 从源码构建
 
-使用 JDK 17 和 Android SDK 34。在 Windows 上运行 `gradlew.bat assembleDebug`，在 macOS 或 Linux 上运行 `./gradlew assembleDebug`。生成的 APK 位于 `app/build/outputs/apk/debug/`。
+使用 JDK 17 和 Android SDK 34。标准版使用 Gradle 任务 `assembleStandardDebug`，Android 6.0 接收版使用 `assembleLegacyReceiverDebug`。在 Windows 上通过 `gradlew.bat` 运行，在 macOS 或 Linux 上通过 `./gradlew` 运行。APK 位于 `app/build/outputs/apk/` 对应变体的目录。发布页的 Android 6.0 APK 为此前保留的测试包。
 
 ## 许可证与致谢
 

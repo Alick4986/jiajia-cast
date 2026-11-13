@@ -38,6 +38,7 @@ class Phase0Service : Service() {
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var connection = Socket()
     private data class Channel(val input: DataInputStream, val output: DataOutputStream)
+    private class ConnectionFailure(message: String, cause: Throwable? = null) : java.io.IOException(message, cause)
     private var projection: MediaProjection? = null
     private var source: VideoSource? = null
     private var worker: Thread? = null
@@ -62,6 +63,8 @@ class Phase0Service : Service() {
             val frameRate = intent?.getIntExtra(FRAME_RATE, 30)?.takeIf { it in FPS_OPTIONS } ?: 30
             val bufferMs = intent?.getIntExtra(BUFFER_MS, 1000)?.takeIf { it in BUFFER_OPTIONS } ?: 1000
             val options = CastOptions(bufferMs, intent?.getBooleanExtra(FILL_SCREEN, false) == true)
+            val manual = intent?.getBooleanExtra(MANUAL, false) == true
+            val qualityIndex = intent?.getIntExtra(QUALITY, VideoQuality.CLEAR.ordinal) ?: VideoQuality.CLEAR.ordinal
             require(permission != null && !address.isNullOrBlank() &&
                 width in 16..MAX_VIDEO_SIZE && height in 16..MAX_VIDEO_SIZE)
             val notification = notification()
@@ -78,7 +81,7 @@ class Phase0Service : Service() {
             }, main)
             state = "正在连接投影仪…"
             worker = Thread({
-                send(media, address, width, height, bitrate, frameRate, options, mutePhone)
+                send(media, address, width, height, bitrate, frameRate, options, mutePhone, manual, qualityIndex)
             }, "mirror-sender").also { it.start() }
         } catch (error: Exception) {
             DiagLog.log("无法启动投屏：${error.message}")
@@ -90,26 +93,33 @@ class Phase0Service : Service() {
 
     private fun send(
         media: MediaProjection, address: String, width: Int, height: Int, bitrate: Int,
-        frameRate: Int, options: CastOptions, mutePhone: Boolean
+        frameRate: Int, options: CastOptions, mutePhone: Boolean, manual: Boolean, qualityIndex: Int
     ) {
         var audio: PlaybackAudioCapture? = null
         try {
             val canCaptureAudio = Build.VERSION.SDK_INT >= 29 &&
                 checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            val modern = openChannel(address, width, height, canCaptureAudio, options)
+            val video = VideoSource(media, width, height, frameRate, bitrate, keyIntervalSec = 1f)
+            source = video
+            if (stopping) return
+            if (!video.prepare()) {
+                state = video.startupError ?: "H.264 编码器准备失败"
+                return
+            }
+            if (stopping) return
+            val modern = openChannel(address, video.width, video.height, canCaptureAudio, options)
             val (input, output) = modern ?: run {
                 check(!stopping)
-                requireNotNull(openChannel(address, width, height, canCaptureAudio, null))
+                requireNotNull(openChannel(address, video.width, video.height, canCaptureAudio, null))
             }
             // The receiver has no other messages. EOF lets us stop even on a static screen.
             Thread({
                 try { input.read() } catch (_: java.io.IOException) {}
                 if (!stopping) {
-                    state = "投影仪已断开"
+                    state = "已连上接收端，随后断开"
                     stopSelf()
                 }
             }, "mirror-disconnect").start()
-            val video = VideoSource(media, width, height, frameRate, bitrate, keyIntervalSec = 1f)
             var needsKeyFrame = true
             var videoClockOffset: Long? = null
             video.frameListener = FrameListener { data, key, time ->
@@ -135,10 +145,9 @@ class Phase0Service : Service() {
                     }
                 }
             }
-            source = video
             if (stopping) return
             if (!video.start()) {
-                state = "无法启动屏幕编码，请试较低画质或帧率"
+                state = video.startupError ?: "无法启动屏幕编码"
                 return
             }
             if (canCaptureAudio && Build.VERSION.SDK_INT >= 29) {
@@ -159,17 +168,36 @@ class Phase0Service : Service() {
                 else -> "正在投屏（请手动调低手机媒体音量）"
             }
             if (modern == null) state += " · 旧版接收端，请升级以应用缓冲和显示设置"
+            streamInfo = "${video.width} × ${video.height} · 上限 $frameRate 帧/秒"
+            var recorded = false
+            var sampleStart = android.os.SystemClock.elapsedRealtime()
+            var sentFrames = 0
             while (!stopping && video.running) {
                 val sound = audioFrames.poll()
                 if (sound != null) writeFrame(output, sound)
                 val frame = if (sound != null) frames.poll()
                     else frames.poll(if (audio != null) 12L else 500L, TimeUnit.MILLISECONDS)
-                if (frame != null) writeFrame(output, frame)
+                if (frame != null) {
+                    writeFrame(output, frame)
+                    sentFrames++
+                    if (!recorded && frame.type == 1) {
+                        recordConnection(address, frameRate, options, mutePhone, manual, qualityIndex)
+                        recorded = true
+                    }
+                }
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - sampleStart >= 1000) {
+                    val fps = sentFrames * 1000L / (now - sampleStart)
+                    streamInfo = "${video.width} × ${video.height} · 发送 $fps 帧/秒"
+                    sampleStart = now
+                    sentFrames = 0
+                }
             }
         } catch (error: Exception) {
             if (!stopping) {
                 DiagLog.log("投屏中断：${error.message}")
-                state = "连接失败，请确认投影仪正在接收"
+                state = if (error is ConnectionFailure) error.message ?: "连接失败"
+                else "已连上接收端，随后断开（${error.javaClass.simpleName}）"
             }
         } finally {
             stopping = true
@@ -181,6 +209,26 @@ class Phase0Service : Service() {
         }
     }
 
+    private fun recordConnection(
+        address: String, frameRate: Int, options: CastOptions, mutePhone: Boolean, manual: Boolean, qualityIndex: Int
+    ) {
+        val prefs = getSharedPreferences("cast_settings", MODE_PRIVATE)
+        val edit = prefs.edit()
+            .putString("last_address", address)
+            .putString("last_device", receiverLabel)
+            .putInt("last_quality", qualityIndex)
+            .putInt("last_fps", frameRate)
+            .putInt("last_buffer", options.bufferMs)
+            .putBoolean("last_fill", options.fillScreen)
+            .putBoolean("last_mute", mutePhone)
+        if (manual) {
+            val previous = prefs.getString("manual_history", "").orEmpty().split(',')
+            val recent = (listOf(address) + previous).filter { it.isNotEmpty() }.distinct().take(5)
+            edit.putString("manual_history", recent.joinToString(","))
+        }
+        edit.apply()
+    }
+
     private fun openChannel(
         address: String, width: Int, height: Int, audio: Boolean, options: CastOptions?
     ): Channel? {
@@ -189,16 +237,25 @@ class Phase0Service : Service() {
         connection = socket
         check(!stopping)
         socket.tcpNoDelay = true
-        socket.connect(InetSocketAddress(address, VIDEO_PORT), 4500)
+        try {
+            socket.connect(InetSocketAddress(address, VIDEO_PORT), 4500)
+        } catch (error: java.io.IOException) {
+            val reason = when (error) {
+                is java.net.SocketTimeoutException -> "连接超时"
+                is java.net.ConnectException -> "无法建立连接 · ConnectException"
+                else -> error.javaClass.simpleName
+            }
+            throw ConnectionFailure("连不上接收端 $address（$reason）", error)
+        }
         socket.soTimeout = 5000
         val protocol = when {
             options != null -> PROTOCOL_WITH_OPTIONS
             audio -> PROTOCOL_WITH_AUDIO
             else -> PROTOCOL
         }
-        val input = DataInputStream(socket.getInputStream())
-        val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
         try {
+            val input = DataInputStream(socket.getInputStream())
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             output.writeInt(protocol)
             output.writeShort(width)
             output.writeShort(height)
@@ -208,13 +265,21 @@ class Phase0Service : Service() {
                 output.writeShort(options.bufferMs)
             }
             output.flush()
-            check(input.readInt() == protocol)
+            if (input.readInt() != protocol) throw ConnectionFailure("接收端确认回复的协议版本不匹配")
+            socket.soTimeout = 0
+            return Channel(input, output)
+        } catch (error: java.net.SocketTimeoutException) {
+            throw ConnectionFailure("已连到接收端，但等待确认超时", error)
         } catch (error: java.io.IOException) {
             if (options != null && (error is EOFException || error is SocketException)) return null
-            throw error
+            if (error is ConnectionFailure) throw error
+            val reason = if (error is EOFException || error is SocketException) {
+                "接收端在确认前关闭了连接，请查看接收页的连接记录"
+            } else {
+                "已连到接收端，但确认失败（${error.javaClass.simpleName}）"
+            }
+            throw ConnectionFailure(reason, error)
         }
-        socket.soTimeout = 0
-        return Channel(input, output)
     }
 
     private fun writeFrame(output: DataOutputStream, frame: Frame) {
@@ -264,6 +329,7 @@ class Phase0Service : Service() {
         worker?.interrupt()
         try { projection?.stop() } catch (_: Exception) {}
         if (state.startsWith("正在投屏") || state == "正在连接投影仪…") state = "投屏已结束"
+        streamInfo = ""
         active = false
         super.onDestroy()
     }
@@ -296,6 +362,10 @@ class Phase0Service : Service() {
         const val BUFFER_MS = "buffer_ms"
         const val FILL_SCREEN = "fill_screen"
         const val MUTE_PHONE = "mute_phone_media"
+        const val MANUAL = "manual"
+        const val QUALITY = "quality"
+        @Volatile var streamInfo = ""
+        @Volatile var receiverLabel = ""
         @Volatile var active = false
         @Volatile var state = ""
     }

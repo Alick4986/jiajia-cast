@@ -25,7 +25,8 @@ internal class MirrorReceiver(
     private val onWaiting: () -> Unit,
     private val onFailure: () -> Unit,
     private val onReady: () -> Unit = {},
-    private val onConnected: (CastOptions) -> Unit = {}
+    private val onConnected: (CastOptions) -> Unit = {},
+    private val onRequestStatus: (String) -> Unit = {}
 ) {
     private val server = ServerSocket()
     @Volatile private var client: Socket? = null
@@ -40,8 +41,18 @@ internal class MirrorReceiver(
                     server.accept().use { connection ->
                         client = connection
                         if (!server.isClosed) {
-                            try { receive(connection) } catch (error: Exception) {
+                            onRequestStatus("已收到连接请求")
+                            try {
+                                receive(connection)
+                            } catch (error: Exception) {
                                 DiagLog.log("投屏连接结束：${error.message}")
+                                if (!server.isClosed) {
+                                    onRequestStatus(when (error) {
+                                        is java.net.SocketTimeoutException -> "已收到请求，等待参数超时"
+                                        is java.io.EOFException -> "已收到请求，发送端已关闭连接"
+                                        else -> "已收到请求，连接中断（${error.javaClass.simpleName}）"
+                                    })
+                                }
                             }
                         }
                         client = null
@@ -63,14 +74,20 @@ internal class MirrorReceiver(
         connection.soTimeout = 8000
         val input = DataInputStream(BufferedInputStream(connection.getInputStream()))
         val protocol = input.readInt()
-        if (protocol != PROTOCOL && protocol != PROTOCOL_WITH_AUDIO && protocol != PROTOCOL_WITH_OPTIONS) return
+        if (protocol != PROTOCOL && protocol != PROTOCOL_WITH_AUDIO && protocol != PROTOCOL_WITH_OPTIONS) {
+            return onRequestStatus("已收到请求，协议版本不支持")
+        }
         val width = input.readUnsignedShort()
         val height = input.readUnsignedShort()
-        if (width !in 16..MAX_VIDEO_SIZE || height !in 16..MAX_VIDEO_SIZE || width % 2 != 0 || height % 2 != 0) return
+        if (width !in 16..MAX_VIDEO_SIZE || height !in 16..MAX_VIDEO_SIZE || width % 2 != 0 || height % 2 != 0) {
+            return onRequestStatus("已收到请求，画面尺寸不支持（${width}×$height）")
+        }
         val flags = if (protocol == PROTOCOL_WITH_OPTIONS) input.readUnsignedByte() else 0
         val options = if (protocol == PROTOCOL_WITH_OPTIONS) {
             val delayMs = input.readUnsignedShort()
-            if (delayMs !in BUFFER_OPTIONS || flags and (FLAG_AUDIO or FLAG_FILL).inv() != 0) return
+            if (delayMs !in BUFFER_OPTIONS || flags and (FLAG_AUDIO or FLAG_FILL).inv() != 0) {
+                return onRequestStatus("已收到请求，投屏设置无效")
+            }
             CastOptions(delayMs, flags and FLAG_FILL != 0)
         } else {
             CastOptions()
@@ -98,8 +115,9 @@ internal class MirrorReceiver(
         try {
             if (!sink.start()) return
             worker.start()
-            onConnected(options)
             DataOutputStream(connection.getOutputStream()).writeInt(protocol)
+            onRequestStatus("已确认连接，等待音画")
+            onConnected(options)
             // A static screen may produce no new frames. Closing the socket interrupts readFully().
             connection.soTimeout = 0
             while (!server.isClosed) {

@@ -12,8 +12,24 @@ android {
         applicationId = "com.mirrorcast.lan"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.2.7"
+        versionCode = 10
+        versionName = "0.2.8"
+    }
+
+    flavorDimensions += "device"
+    productFlavors {
+        create("standard") {
+            dimension = "device"
+            versionCode = 14
+            versionName = "0.2.12"
+            buildConfigField("boolean", "RECEIVER_ONLY", "false")
+        }
+        create("legacyReceiver") {
+            dimension = "device"
+            minSdk = 23
+            applicationIdSuffix = ".receiver"
+            buildConfigField("boolean", "RECEIVER_ONLY", "true")
+        }
     }
 
     buildFeatures {
